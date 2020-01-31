@@ -1,0 +1,903 @@
+---
+title: "Playlist of Death"
+output: html_notebook
+---
+
+Can we determine musician mortality rates by analyzing WFMU radio playlists?
+
+
+#Load Required Libraries and Data
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+library(GGally)
+library(stringr)
+library(tidyverse)
+library(lubridate)
+library(knitr)
+library(xts)
+library(rvest)
+library(class) #k-nn 
+library(gmodels) #CrossTable
+library(e1071) #naiveBayes
+
+# function to mutate only rows meeting a certain condition
+#most useful enhancement to dplyr ever!
+mutate_cond <- function(.data, condition, ..., envir = parent.frame()) {
+  condition <- eval(substitute(condition), .data, envir)
+  condition[is.na(condition)] = FALSE
+  .data[condition, ] <- .data[condition, ] %>% mutate(...)
+  .data
+}
+
+load("playlists.rdata")
+```
+#The Data Set
+
+Free form radio, WFMU.ORG, maintains a huge trove of past playlists from many DJ's radio shows.  More recently, web-only programming has been added to this.  This data set offers lots of opportunities for analysis.  I scraped all the playlists I could from the web site and started asking questions (after I got permission to scrape from station manager, Ken Freedman).  While not qualifying as "big data," the data set is pretty extensive. Let's look as some summary stats.
+
+```{r, warning=FALSE}
+year_count<-playlists %>% 
+  ungroup() %>% 
+  transmute(Year_count=year(AirDate)) %>% 
+  distinct() %>% nrow()
+dj_count<-playlists %>% group_by(DJ) %>% summarise(DJs=n()) %>% nrow #DJs
+show_count<-playlists %>% group_by(DJ,AirDate) %>% summarise(Shows=n()) %>% nrow()
+#Artists
+artist_count<-playlists %>% ungroup() %>% select(ArtistToken) %>% distinct() %>% nrow()
+
+#songs
+song_count<-playlists %>% ungroup() %>% select(ArtistToken,Title) %>% distinct() %>% nrow()
+
+spins_count<-nrow(playlists) # spins
+
+the_numbers<-data_frame(
+           Count=c(year_count,dj_count,show_count,artist_count,song_count,spins_count),
+           Stat=c("Years","DJs","Shows","Artists","Songs","Spins"))
+
+the_numbers %>% 
+  kable(caption="WFMU Archives by the Numbers",
+        col.names=c('WFMU',' Archives by the Numbers'),
+        format.args = list(big.mark=","))
+```
+
+
+You can see the ultimate result of my work at the [WFMU Playlist Explorer](wfmu.servebeer.com), a fun toy, if I do say so.
+
+#Morbid Thoughts
+
+When playing around with the artist data for "Prince" I noticed a spike in plays around his death.  
+```{r}
+#few playlists before 2002
+cutoff_date<-as.Date("2002-01-01")
+dead_artist_plays<-playlists %>% 
+  ungroup() %>% 
+  filter(AirDate > cutoff_date) %>% 
+  filter(ArtistToken=="Prince") %>% 
+  mutate(AirDate=as.yearqtr(AirDate)) %>% 
+  group_by(AirDate) %>% 
+  summarise(Spins=n()) %>% 
+  arrange(AirDate)
+gg<-dead_artist_plays %>% ggplot(aes(x=AirDate,y=Spins))+geom_col()
+gg<-gg+scale_x_continuous()
+gg<-gg+labs(y="Spins per Quarter",title="Dead Artist Effect: Prince")
+gg
+
+```
+
+WFMU is a "free form" station where DJs play what they like, so this is not a surprise. This got me to thinking, can we use the data set to tell us who died and when?
+
+This is still "small data" in the scheme of things.  Plenty of song plays but not plenty of artists who died and who are popular with the DJs at the station.  So, this won't be an exercise in machine learning as we don't have a robust training set.  Still, as we saw with the Prince data the mortality, the spike is quite the outlier.  Maybe we can simply calibrate a number that gives us a high accuracy rate and discover some deaths that don't immediately come to mind.  The recenly departed that immediately pop into my head are Prince, Bowie, Chuck Barry and one less famous artist, Leslie Gore.  How do they look?
+
+We're going to be running this chart a lot so let's make a function.
+```{r}
+
+gg_play_freq<-function(artists,cutoff_date=Sys.Date()-(365*5)){
+  artist_plays<-playlists %>% 
+    ungroup() %>% 
+    filter(AirDate > cutoff_date) %>% 
+    filter(ArtistToken %in% artists) %>% 
+    mutate(AirDate=as.yearqtr(AirDate))  %>% 
+    group_by(DJ,ArtistToken,AirDate) %>% 
+    summarise(Spins=n()) %>% 
+    arrange(AirDate) %>% 
+    {.}
+  gg<-artist_plays %>% ggplot(aes(x=AirDate,y=Spins))
+  gg<-gg+geom_col()+facet_wrap(~ArtistToken) 
+  gg<-gg+scale_x_continuous(breaks=seq(year(cutoff_date),year(Sys.Date()),by=2))
+  gg<-gg+ggtitle("Dead Artist Effect")
+  gg
+  
+}
+
+cutoff_date<-as.Date("2008-01-01")
+dead_artists=c('David Bowie','Prince','Chuck Berry','Lesley Gore')
+gg_play_freq(dead_artists,cutoff_date)
+```
+
+Yes, I think we are onto something.  We need to do some outlier detection. The question is what is a suitable filter to determine probable mortality.  One simple way might be to simply look at the play count in a quarter as a multiple of the average and select everything above a certain multiple. A better way, Z-score, is what I often use to look at anomalous movements in financial markets.  This is the number of standard deviations from the mean. It is a little superior to the first method as is scales the outline by how much beyond the normal variability it is.
+
+We could use more formal statistical methods of of outlier detection. One might be to use a linear model to detrend the data before looking at a z-score.  The rising number of DJs posting playlists over time means there is trend growth for most artists. Visually,though, we see the spikes in plays are so extreme they reduce the trend to irrelevance.  We could also use autoreggresive moving average (ARIMA) techniques. This is common to detect outliers in time series.  I will not be exploring these for two reasons.  The series of play counts we are looking at are reasonably stationary.  Our simple techniques do a good job highlighting the spikes.  The other is computing time.  Running an outlier detection package like `tsoutlier` does a good job but no better than our simple tools and is much, much slower.  Hand grenade when a fly swatter works and all that.  Still, it prompted me to learn how to use the package so WIN!
+
+Three artists shown above are (were) superstars so I would guess their spikes were extreme.  I wouldn't expect more obscure artists, like Lesley Gore to be picked up by a wide swath of the DJ population.  Let's experiment with different screen levels.
+
+#Play Count Features
+First let's bucket all the artist plays by quarter, find the mean number of plays and the z-score, then keep just the maximum z_score period for each artist.
+
+
+```{r}
+play_count<-playlists %>% 
+  ungroup() %>% 
+  mutate(AirDate=as.yearqtr(AirDate))  %>% 
+  group_by(ArtistToken,AirDate) %>% 
+  summarise(Spins=n()) %>% 
+  mutate(avg=mean(Spins),sd=sd(Spins)) %>% 
+  filter(!is.na(sd)) %>% 
+  mutate(z_score=(Spins-avg)/sd) %>% 
+  filter(!is.na(z_score)) %>% 
+  select(-avg,-sd)
+
+play_count_z<- play_count %>% 
+  group_by(ArtistToken) %>% 
+  summarize(z_score=max(z_score)) %>% 
+  left_join(play_count)
+
+#rm(play_count) #This is a 400 thousand-long table that we don't need any more.
+head(play_count_z)
+```
+
+We have compared the number of spins each quarter to the average spins per quarter and computed the z-score as `(Spins-avg)/sd`.   How do we screen for deaths? What z-scores and multiples did the artists we listed above show at their extremes?
+
+```{r}
+play_count_z %>% 
+  filter(ArtistToken %in% dead_artists)
+```
+
+So a z-score of 6.5 might be a good screen level.
+
+```{r}
+play_count_z %>% 
+  filter(z_score>6.5)
+
+```
+The weakness in this approach is our threshhold captures a lot of bands/artists where there was no mortality event. ELO, The Dictators, The Clash, etc. The false postive rate is pretty high. Further, the threshold to use for z-scores to use is not obvious. There are no obvious outliers of outliers.
+
+```{r}
+cutoff_date<-as.Date("2001-01-01")
+not_dead_artists<-c("Elo","Dictators","Residents")
+
+gg_play_freq(not_dead_artists,cutoff_date)
+
+```
+
+
+What about false negatives.  As we lower the threshold for detection the list grows pretty big.  Do you see any mortality events in the next 1 point of z-scores?
+
+```{r}
+play_count_z %>% 
+  filter(z_score<6.5 ) %>% 
+  filter(z_score>5.5 ) %>% 
+  filter(ArtistToken=)
+```
+Alas, yes. The Band (Levon Helm), Bobby Womack and Etta James are the ones I found right away.  Bjork is not dead yet.
+
+```{r}
+cutoff_date<-as.Date("2001-01-01")
+artists<-c("Band","BobbyWomack","EttaJames","Bjork")
+gg_play_freq(artists,cutoff_date)
+
+```
+
+What might we do to improve this?
+
+One thing to note is the banal observation that there might be reasons for a flurry of plays by an artist for other reasons than mortality.  A new album, a performance in town, a band member is in the news beacause of some outrageous behavior, etc.  A Google search for news around that time might reveal the answer but an algorithmic approach to that is outside the scope of this post.
+
+Another thought is that invididual DJs might feature a particular artist on one show and that spikes the play count.  Compare that to a mortality event where we assume many DJs play the artist's music in the wake of the news.  Let's look at the dispersion of DJ's playing an artists music around play count spikes.  In the chart below each color represents a different DJ.
+
+```{r}
+gg_play_freq_dj<-function(artists,cutoff_date=Sys.Date()-(365*5)){
+artist_plays<-playlists %>% 
+    ungroup() %>% 
+    filter(AirDate > cutoff_date) %>% 
+    filter(ArtistToken %in% artists) %>% 
+    mutate(AirDate=as.yearqtr(AirDate))  %>% 
+    group_by(DJ,ArtistToken,AirDate) %>% 
+    summarise(Spins=n()) %>% 
+    arrange(AirDate)
+  gg<-artist_plays %>% ggplot(aes(x=AirDate,y=Spins,fill=DJ))
+  gg<-gg+geom_col()+facet_wrap(~ArtistToken) 
+  gg<-gg+scale_x_continuous(breaks=seq(year(cutoff_date),year(Sys.Date()),by=2))
+  gg<-gg+ggtitle("Dead Artist Effect")+theme(legend.position = "none")
+  gg
+}  
+
+dead_artists %>% gg_play_freq_dj()
+```
+Now let's look at our not dead artists.
+```{r}
+cutoff_date<-(as.Date("2002-01-01"))
+not_dead_artists<-c(not_dead_artists,"Bjork")
+not_dead_artists %>% gg_play_freq_dj(cutoff_date)
+```
+Huzzah!  In every mortality case a diverse group of DJs played the artist and in every not-dead case one DJ amounted to the lion's share of plays.  
+
+The Dictators are a less clear example, showing huge spike by many DJs in the fall of 2007 with no deaths.  This is an example of a new album release spike.  "Every Day is Saturday" is a collection of Dictators rarities officially released in January of 2008.  The 'Tators are a NYC favorite and I assume WFMU got an early copy. These cases are going to slip through our screens and produce false positives.
+
+Let's rebuild and add a feature to our data set that includes the number of DJs who played the artist in any quarter and how many times the average number of DJs who played the artist.  Further, let's calculate the fraction of plays accounted for by one DJ.
+```{r}
+#find DJ play diversity
+dj_counts<-playlists %>% 
+  ungroup() %>% 
+  mutate(AirDate=as.yearqtr(AirDate))  %>% 
+  group_by(ArtistToken,AirDate,DJ) %>% 
+  summarise(Spins=n()) %>% 
+  summarise(dj_count=n()) %>% 
+  group_by(ArtistToken) %>% 
+  mutate(avg_dj_count=mean(dj_count)) %>% 
+  mutate(dj_multiple=dj_count/avg_dj_count) %>% 
+  select(ArtistToken,AirDate,dj_count,dj_multiple) %>% 
+  {.}
+
+play_count_z2<- play_count_z %>% 
+  select(ArtistToken,AirDate,z_score) %>% 
+  left_join(dj_counts)
+
+play_count<-play_count %>%
+  left_join(dj_counts)
+
+head(play_count_z2)
+```
+
+Add DJ concentration feature
+```{r}
+# find fraction of plays in a quarter from one DJ
+max_dj_counts<-playlists %>% 
+  ungroup() %>% 
+  mutate(AirDate=as.yearqtr(AirDate))  %>% 
+  group_by(ArtistToken,AirDate,DJ) %>% 
+  summarise(Spins=n()) %>% 
+  mutate(spin_count=sum(Spins)) %>% 
+  top_n(1,Spins) %>% 
+  mutate(dj_concentration=Spins/spin_count) %>% 
+  ungroup() %>% 
+  select(AirDate,ArtistToken,dj_concentration) %>% 
+  unique() %>% 
+  {.}
+
+play_count_z2<- play_count_z2 %>%  
+  left_join(max_dj_counts) %>% 
+  unique()
+
+play_count<-play_count %>% 
+  left_join(max_dj_counts)
+
+```
+
+Now we have to find the right mix of z_score and dj_multiple and dj_concentration that gives us the best trade-off of detected deaths without false positives.  What does the distribution of DJ counts look like at the max z-score points?
+```{r}
+play_count_z2 %>%
+  ggplot(aes(x=dj_multiple,y=z_score))+geom_point()
+  
+```
+
+
+```{r}
+z_s<-6.5
+dj_m<-4
+dj_c<-0.5
+play_count_z2 %>% filter(z_score>z_s,dj_multiple>dj_m)
+```
+
+```{r}
+play_count_z2 %>% filter(z_score>z_s,dj_multiple>dj_m,dj_concentration<dj_c)
+```
+
+We've taken feature engineering about as far is it can go.  We have a pretty good idea, experimentally, what mix of feature thresholds we need to get it a good list but there are still false postives and negatives galore.  We need some way to get good external check on the whether an arist has died.  Let's turn to Wikipedia and [this page.](https://en.wikipedia.org/wiki/List_of_deaths_in_rock_and_roll).
+
+Parsing HTML is a dark art and I would not rise to the level of sorcerer's apprentice.  Helpfully, the date we want is in tables.  Unhelpfully, if a band name is associated with an artist name it appears in the same table cell as the artist, encased in a `<small><\small>` tag.  Extracting the just the text from the cell concatates the two items without a separator.  We would like to break the person and the band into separate columns and we need to search/replace the raw html text to do it. So instead of `<td>Person<small>Band<\small><\td>` we get `<td>Person<\td>Band<\td>`.
+
+```{r}
+death_page1<-read_html("https://en.wikipedia.org/wiki/List_of_deaths_in_rock_and_roll")
+write_html(death_page1,file="death_page1.html")
+death_page2<-read_html("https://en.wikipedia.org/wiki/List_of_2010s_deaths_in_rock_and_roll")
+write_html(death_page2,file="death_page2.html")
+```
+
+```{r}
+#join pre-2010 to post 2010
+death_page<-death_page1
+death_page_child<-death_page1 %>% xml_children() %>% .[2]
+death_page2_child<-death_page2 %>% xml_children() %>% .[2]
+xml_add_sibling(death_page_child,death_page2_child)
+write_html(death_page,file="death_page.html")
+
+#Very Crude (or clever) Hack follows
+# read it in as a raw text file and edit the tags
+# to break the artist name and band names into two columns
+# by replacing '<small>' with '</td><td>' and
+# '</small>' with ''.
+death_page_text<-read_file("death_page.html")
+death_page_text<- gsub( "<small>", "</td><td>", death_page_text )
+death_page_text<- gsub( "</small>", "", death_page_text )
+write_file(death_page_text,"death_page.html")
+#read it back in
+death_page<-read_html(death_page_text)
+
+
+#get tables
+death_table_nodes<-death_page %>% html_nodes("table")
+#mortality tables start at table 5 on the page.  COULD CHANGE!
+death_table_nodes<-death_page %>% html_nodes("table") %>% .[5:length(death_table_nodes)]
+
+
+#We now have multiple tables we need to combine.  Two problems.  First, the
+#columns are not the same over all tables. Some are missing column names.
+#Second, some columns with the same name have different data types.  This seems
+#to preclude a nice apply or map solution, forcing me to iterate over the list
+#of data frames.
+
+death_tables<-death_table_nodes %>% 
+  html_table(fill=TRUE)
+
+#make sure they have the same number of columns. Truncate if necessary
+
+
+for (n in seq_along(death_tables)){
+  if (n > length(death_tables)) break
+  #make sure they have the same number of columns, six. Truncate if necessary.
+  if (ncol(death_tables[[n]])>5){
+    death_tables[[n]]<-death_tables[[n]][,1:6]
+    names(death_tables[[n]])<-c("Name","Band","Age",
+                                "Date","Location","Cause_of_Death")
+  death_tables[[n]]<-death_tables[[n]] %>% mutate_all(as.character)
+  #death_tables[[n]] %>% mutate_all(as_data_frame)
+  } else {
+    death_tables[[n]]<-NULL
+  }
+}
+#Now can we join
+deaths<-as_data_frame(map_df(death_tables,bind_rows))
+
+```
+
+```{r}
+# shift columns where no band names exist
+temp<-deaths %>% mutate()
+  mutate(test=as.numeric(Age))
+
+temp1<-temp %>% 
+  filter(is.na(test)) %>% 
+  mutate(Cause_of_Death=Location) %>% 
+  mutate(Location=Date) %>% 
+  mutate(Date=Age) %>% 
+  mutate(Age=Band) %>% 
+  mutate(Band='') %>% 
+  select(-test)
+
+temp2 <- temp %>%
+    filter(!is.na(test)) %>% 
+    select(-test)
+deaths<-bind_rows(temp1,temp2)
+
+#remove footnotes
+deaths<-deaths %>% mutate(Cause_of_Death=str_replace(Cause_of_Death,"\\[[0-9,]+\\]",""))
+deaths<-deaths %>% mutate_cond(is.na(Cause_of_Death),Cause_of_Death="Not Specified")
+deaths<-deaths %>% mutate_cond(Cause_of_Death=="",Cause_of_Death="Not Specified")
+```
+
+
+```{r}
+#while we are at it, what are common causes of death?
+#add a new column "general cause"
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"suicide"),General_Cause="Suicide")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"cancer"),General_Cause="Cancer")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"tumor"),General_Cause="Cancer")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"oma"),General_Cause="Cancer")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"accident"),General_Cause="Accident")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death)," fall"),General_Cause="Accident")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"hit"),General_Cause="Accident")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"drug"),General_Cause="Drugs")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"overdose"),General_Cause="Drugs")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"shot"),General_Cause="Murdered")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"shooting"),General_Cause="Murdered")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"murder"),General_Cause="Murdered")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"stab"),General_Cause="Murdered")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"heart"),General_Cause="Heart Failure")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"cardiac"),General_Cause="Heart Failure")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"aids"),General_Cause="AIDS")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"hiv"),General_Cause="AIDS")
+deaths<-deaths %>% 
+  mutate_cond(str_detect(tolower(Cause_of_Death),"diabetes"),General_Cause="Diabetes")
+
+cause_table<-deaths %>% 
+  count(General_Cause) %>% 
+  arrange(desc(n))
+
+cause_table<-cause_table %>% mutate(General_Cause= as_factor(General_Cause))
+cause_table
+```
+```{r}
+#plot, leaving out "not specified"
+gg<-cause_table[2:11,]  %>% 
+  ggplot(aes(General_Cause,n))+geom_col()
+gg<-gg+coord_flip()
+gg
+```
+
+
+Now we need to put the nicely formatted data into a form consistent with the data in our playlists.  To to this we need to parse the date string and put both the artist name and band name(s) into a tokenized list conforming the playlist rules.
+```{r warning=FALSE}
+load("deaths.rdata")
+#playlist count uses yearqtr as airdate
+deaths<-deaths %>% mutate(AirDate=as.yearqtr(Date))
+```
+
+Create list of name/band tokens for each row.  This data wrangling is identical to the process by which the `ArtistToken`s were created in the playlist data set.
+```{r}
+
+#we don't acutally care what artist is in what band, just that we have a token for all bands and artists
+#and a yearqtr variable for each.
+#use tidyr to gather the tokens
+death_tokens<-deaths %>% 
+  select(-Age,-Location,-General_Cause) %>% 
+  gather(key="key",value="ArtistToken",-AirDate,-Date) %>% 
+  select(-key) %>% 
+  filter(!is.na(ArtistToken)) %>% 
+  arrange(Date)
+
+#tokenize
+# one artist is all punctuation so give !!! special treatment
+# now change some common punctuation to space
+print("Stripping Punctuation")
+
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"\\&"," ")
+
+death_tokens$ArtistToken<-str_to_lower(death_tokens$ArtistToken)
+# I choose to strip out the stuff below though dealing with it might get better analysis
+#remove any text in parentheses
+print("Stripping filler words")
+# get rid of anything between parenthesis
+#tricky regex to handle cases of multiple parentheticals in one artist
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"(\\([^(]+\\))","")
+
+#How pretentious
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"Ö","O")
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"ö","o")
+
+#now get rid of remaining non-word characters except space
+
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"[^A-Z^a-z^ ^0-9]","")
+#make "new york" one word.  Lots of bands start with the term
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"new york","newyork")
+
+#make "x ray" one word. hopefully we've stripped out the dash already.Lots of bands start with the term
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"x ray","xray")
+
+#now some connecting words that might be spelled/used variantly
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"and | of | the "," ")
+
+#and leading "the"
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"^the "," ")
+# strip leading/trailing whitespace
+death_tokens$ArtistToken<-str_trim(death_tokens$ArtistToken)
+
+#did we create any null entries
+playlists<-filter(playlists,Artist!="")
+playlists<-filter(playlists,Artist!="Artist")
+
+#restore title case
+death_tokens$ArtistToken<-death_tokens$ArtistToken %>% str_to_title()
+
+#combine first two words
+death_tokens<-death_tokens %>% 
+  separate(ArtistToken,into=c("token1","token2"),extra="drop",fill="right") %>%
+  transmute(Date=Date,AirDate=AirDate,ArtistToken=paste0(token1,if_else(!is.na(token2),token2,""))) %>% 
+  filter(ArtistToken != "")
+
+print("Combining iconic 2-name artists into one name")
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"RollingStones","Stones")
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"EnnioMorricone","Morricone") #only on WFMU!
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"DavidBowie","Bowie")
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"BobDylan","Dylan")
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"Yola","YoLaTengo")
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"ElvisPresley","Elvis")
+
+#Using comma as a band separator messed up commas in band names. What we know:
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"WindFire","EarthWind")
+death_tokens$ArtistToken<-str_replace_all(death_tokens$ArtistToken,"LakePalmer","EmersonLake")
+
+#add a dummy column to flag mortality when we join it with play counts
+death_tokens<-death_tokens %>% mutate(death_flag="Death")
+
+```
+Now merge it with play counts
+```{r}
+play_count<-left_join(play_count,death_tokens) %>% 
+  select(-Date) %>% 
+  mutate_cond(is.na(death_flag),death_flag="NonEvent")
+
+play_count %>% filter(death_flag=="Death")
+
+play_count_z2<-play_count_z2 %>% 
+  left_join(death_tokens) %>%
+  mutate_cond(is.na(death_flag),death_flag="NonEvent")
+
+
+```
+We have 833 instances where there is a mortality event associated with the artist or band. Note that, where an artist name comes up, it does not necessarily mean that artist died, just that someone associated died.  Alice Cooper is alive and kicking but "Alice Cooper," the band, lost a member in 2014.
+
+# The curious case of Bobby Womack
+He died on a June 27 so his date is in the second quarter but within days of the third quarter The pickup in plays of his songs shows up in Q3.  Further, most DJs at the station have shows only weekly, so there will be lag.
+```{r}
+death_tokens %>% filter(ArtistToken=="BobbyWomack")
+play_count %>% ungroup() %>% filter(ArtistToken=="BobbyWomack",z_score>0.5)
+
+```
+
+Perhaps we should advance the death dates by a week to determine the `AirDate` quarter they will fall in.
+
+```{r}
+death_tokens_adj<-death_tokens %>% mutate(AirDate=as.yearqtr(Date+7))
+
+play_count<-left_join(select(play_count,-death_flag),death_tokens_adj) %>% 
+  select(-Date) %>% 
+  mutate_cond(is.na(death_flag),death_flag="NonEvent")
+
+play_count %>% ungroup() %>% filter(ArtistToken=="BobbyWomack",z_score>0.5)
+```
+That fixed it.
+
+Now we have to find the right mix of z_score and dj_multiple and dj_concentration that gives us the best trade-off of detected deaths without false positives.  What does the distribution of DJ counts look like at the max z-score points?  Add death flag to the set of feature at maximum z_score.
+
+```{r, message=FALSE, warning=FALSE}
+
+play_count<-play_count %>%
+  left_join(death_tokens_adj) %>% 
+  mutate_cond(is.na(death_flag),death_flag="NonEvent")
+
+play_count %>%
+  ggplot(aes(x=z_score,fill=death_flag))+geom_density(alpha=0.6)+
+  labs(title="Z_Score")
+
+play_count %>%
+  ggplot(aes(x=dj_multiple,fill=death_flag))+geom_density(alpha=0.6)+
+  labs(title="dj_multiple")
+
+play_count %>%
+  ggplot(aes(x=dj_concentration,fill=death_flag))+geom_density(alpha=0.6)+
+  labs(title="dj_concentration")
+```
+```{r}
+play_count %>% 
+  ungroup() %>% 
+  select(z_score,dj_concentration,dj_multiple,death_flag) %>% 
+  unique() %>% 
+  ggpairs(aes(color = death_flag, alpha = 0.4))
+```
+
+
+# Let the Machine Learn!
+
+There are two differnt questions we might apply our classifier to.  First, when an outlier occurs, does it signify a death?  This was our original question. Second, using the whole sample, can we identify when a death occurs?
+
+We have the features, `Spins`, `z_score`, `dj_concentration` `dj_count` and `dj_multiple`.  We have the prediction variable, `death_flag`.  
+
+#Detrend?
+
+Note that total plays and the number of DJs have been increasing.  So there is a trend to the play counts.  There is not a trend to the ratios, however to we can safely not detrend the data.  How can the number of DJs increase when there are only so many hours in the week?  The rotations have gotten more frequent and the emergence of web streams has broough more DJs "on air."
+
+```{r}
+play_count %>% 
+  group_by(AirDate) %>% 
+  summarize(n=n()) %>% 
+  ggplot(aes(AirDate,n))+geom_col()
+```
+
+No trend.
+```{r}
+play_count_z2 %>% 
+  group_by(AirDate) %>% 
+  summarize(z_score=mean(z_score)) %>% 
+  ggplot(aes(AirDate,z_score))+geom_col()
+
+```
+
+Filter out pre-2002, select only relevant features and classifier and normalize data.
+```{r}
+normalize<-function(x){
+  (x-min(x))/(max(x)-min(x))
+}
+
+play_count_norm<-play_count %>% 
+  ungroup() %>% 
+  filter(AirDate>as.yearqtr("2002-01-01")) %>% 
+  select(z_score,dj_multiple,dj_concentration,death_flag) %>% 
+  unique() %>% 
+  mutate_if(is.double,normalize) %>% 
+  mutate(death=ifelse(death_flag=="Death",1,0)) %>% 
+  select(-death_flag)
+```
+
+
+Do it again with just the two significant variables
+```{r}
+model_logit <- glm(death ~ z_score + dj_concentration,
+             family=binomial(link='logit'),
+             data=play_count_norm)
+
+p <- predict(model_logit, type="response")
+Class<-p > 0.5
+table(Class)
+
+```
+It doesn't work. There are just too many deaths that, while the artist may have been played at least once, do not register any change in plays.
+
+Try another approach.  How about k-nearest neighbors? Spilt set this time.
+```{r}
+
+set.seed(22275)
+train_sample<-sample(1:nrow(play_count_norm),nrow(play_count_norm)*0.7)
+play_train<-play_count_norm[train_sample,]
+play_train_label<-transmute(play_train,death_label=as.factor(ifelse(death==0,"NonEvent","Death")))
+play_test<-play_count_norm[-train_sample,]
+play_test_label<-transmute(play_test,death_label=as.factor(ifelse(death==0,"NonEvent","Death")))
+play_train<-play_train %>% select(z_score,dj_multiple,dj_concentration)
+play_test<-play_test %>% select(z_score,dj_multiple,dj_concentration)
+
+prop.table(table(play_train_label))
+model_knn<-knn(train=play_train,test=play_test,cl=play_train_label$death_label,k=5)
+summary(model_knn)
+
+```
+We are generating positive values, at least.  Are they any good?
+```{r}
+CrossTable(play_test_label$death_label,model_knn,dnn=c('Actual Events','Predicted Events'))
+```
+This is terrible.  There were 234 deaths but our model only correctly flagged 5 of them.  The problem is that the number of non-events completely swamps the number of deaths.
+
+
+Let's try another approach.  How about Baysian, where we condition a prediction of death upon the play count being an outlier?
+
+Bin the data into categorical variables.  Split z_score at 5-sigma and dj_concentration at 50%.
+
+```{r}
+z_threshhold <- 6.0
+dj_threshhold <- 0.5
+
+play_count_bayes<-play_count %>% 
+  ungroup() %>% 
+  transmute(death=death_flag,
+            z_score_high=ifelse(z_score>z_threshhold,1,0),
+            dj_concentration_high=ifelse(dj_concentration>dj_threshhold,1,0)
+            )
+model_b<-naiveBayes(select(play_count_bayes,-death),play_count_bayes$death)
+model_b_predict<-predict(model_b,newdata=sample_frac(play_count_bayes,.2))
+
+```
+This isn't working.  Mabye we would get better data if we screened out death's where there are only a few DJs who ever played that artist.  Subset playlist to only artists played by more than 10 different DJs.
+
+```{r}
+dj_count_filter<-10
+dj_subset<-playlists %>% 
+  ungroup() %>%
+  filter(AirDate>as.Date("2002-01-01")) %>% 
+  group_by(ArtistToken,DJ) %>% 
+  summarise(n=n()) %>% 
+  summarise(n=n()) %>% 
+  filter(n>dj_count_filter) %>% 
+  select(ArtistToken)
+
+playlist_subset <-  left_join(dj_subset,playlists)
+play_count_subset<-left_join(dj_subset,play_count) %>% 
+  select(-Date) %>% 
+  unique()
+
+
+play_count_subset
+```
+
+We've cut the sample size in half.  Look at the distribution of the features.
+
+```{r}
+play_count_subset %>% 
+  ungroup() %>% 
+  select(z_score,dj_concentration,dj_multiple,death_flag) %>% 
+  ggpairs(aes(color = death_flag, alpha = 0.4))
+```
+Visually, there is much more separation between the two classifiers for each feature.  `dj_multiple` is much improved though the correlation with z_score has increased, still rendering is superfluous.  Let's get rid of it and rerun the models.
+```{r}
+play_count_subset<-play_count_subset %>% select(-dj_multiple)
+play_count_norm<-play_count_subset %>% 
+  ungroup() %>% 
+  filter(AirDate>as.yearqtr("2002-01-01")) %>% 
+  select(z_score,dj_concentration,death_flag) %>% 
+  unique() %>% 
+  mutate_if(is.double,normalize) %>% 
+  mutate(death=ifelse(death_flag=="Death",1,0)) %>% 
+  select(-death_flag)
+
+model_logit <- glm(death ~ z_score + dj_concentration,
+             family=binomial(link='logit'),
+             data=play_count_norm)
+
+p <- predict(model_logit, type="response")
+Class<-p > 0.5
+table(Class)
+
+```
+```{r}
+train_sample<-sample(1:nrow(play_count_norm),nrow(play_count_norm)*0.7)
+play_train<-play_count_norm[train_sample,]
+play_train_label<-transmute(play_train,death_label=as.factor(ifelse(death==0,"NonEvent","Death")))
+play_test<-play_count_norm[-train_sample,]
+play_test_label<-transmute(play_test,death_label=as.factor(ifelse(death==0,"NonEvent","Death")))
+play_train<-play_train %>% select(z_score,dj_concentration)
+play_test<-play_test %>% select(z_score,dj_concentration)
+
+prop.table(table(play_train_label))
+prop.table(table(play_train_label))
+model_knn<-knn(train=play_train,test=play_test,cl=play_train_label$death_label,k=5)
+CrossTable(play_test_label$death_label,model_knn,dnn=c('Actual Events','Predicted Events'))
+
+```
+
+Create "blind" data set for competition.  Scant feature engineering
+```{r}
+#find DJ play diversity
+playlist_summary<-playlists %>% 
+  ungroup() %>% 
+  filter(AirDate>as.Date("2001-12-31")) %>% 
+  mutate(AirDate=as.yearqtr(AirDate))  %>% 
+  group_by(ArtistToken,AirDate,DJ) %>%
+  summarise(Spins=n())
+
+blind__dj_counts<-playlist_summary %>% 
+  summarise(dj_count=n()) %>% 
+  {.}
+
+blind__spin_counts<-playlist_summary %>% 
+  #group_by(ArtistToken,AirDate)
+  summarise(Spins=sum(Spins)) %>% 
+  group_by(ArtistToken) %>% 
+  {.}
+
+# find fraction of plays in a quarter from one DJ
+blind_dj_concentration<-playlist_summary %>% 
+  mutate(spin_count=sum(Spins)) %>% 
+  top_n(1,Spins) %>% 
+  mutate(dj_concentration=Spins/spin_count) %>% 
+  ungroup() %>% 
+  select(AirDate,ArtistToken,dj_concentration) %>% 
+  unique() %>% 
+  {.}
+
+blind_features<-full_join(blind__dj_counts,blind__spin_counts) %>%       full_join(blind_dj_concentration)
+
+blind_features %>% 
+  filter(ArtistToken=="Prince") %>% 
+  ggplot(aes(AirDate,Spins))+geom_col()+
+  geom_line(aes(y=dj_count),size=2,color="red")+
+  geom_line(aes(y=dj_concentration*100),size=2,color="blue")
+
+#merge with death flag
+blind_features<-left_join(blind_features,death_tokens) %>% 
+  select(-Date) %>% 
+  mutate_cond(is.na(death_flag),death_flag="NonEvent")
+
+#anonymyize identifiers
+blind_features<-blind_features %>% 
+  mutate(time=as.integer((AirDate-as.yearqtr(as.Date("2001-12-31")))*4))
+
+blind_features<-blind_features %>% 
+  mutate(event=if_else(death_flag=="Death","event","nonevent"))
+
+blind_artists<-blind_features %>% 
+  ungroup() %>% 
+  select(ArtistToken) %>% 
+  unique()
+
+blind_artists<-blind_artists%>% 
+  bind_cols(id=index(blind_artists))
+
+blind_features<-blind_features %>% left_join(blind_artists)
+
+arts_data<-blind_features %>% 
+  ungroup() %>% 
+  select(id,
+         time,
+         feat_1=dj_count,
+         feat_2=Spins,
+         feat_3=dj_concentration,
+         event)
+#separate training and test sets 70/30
+set.seed(1234)
+train_artists<-blind_artists %>% select(id) %>% sample_frac(0.70)
+test_artists<-blind_artists %>% select(id) %>% anti_join(train_artists)
+arts_data_train <- train_artists %>% left_join(arts_data) %>% arrange(id)
+arts_data_test <- test_artists %>% left_join(arts_data)
+
+arts_data_train %>% 
+  mutate(event_label=ifelse(event=="event","Event","")) %>% 
+  filter(id==(filter(blind_artists,ArtistToken=="Prince") %>% pull(id))) %>% 
+  ggplot(aes(time,feat_2,label=event_label))+geom_col()+
+  geom_line(aes(y=feat_1),size=2,color="red")+
+  geom_line(aes(y=feat_3*100),size=2,color="blue")+
+  geom_text()
+
+```
+
+#now do a feature set with no engineering
+```{r}
+
+#replace ArtistToken with id
+wide_features<-playlist_summary %>% 
+  ungroup() %>% 
+  mutate(Spins=as.integer(Spins)) %>% 
+  left_join(blind_artists) %>% 
+  select(id,everything())
+
+#replace AirDate with time
+wide_features<-wide_features %>% 
+  mutate(time=as.integer((AirDate-as.yearqtr(as.Date("2001-12-31")))*4)) %>%
+  left_join(death_tokens) %>% 
+  mutate(event=ifelse(is.na(death_flag),"nonevent","event")) %>% 
+  select(time,everything())
+
+#spread it out
+wide_features<-wide_features %>% spread(DJ,Spins,fill=0,convert=TRUE)
+
+#merge with death flag
+wide_features<-wide_features %>% 
+  left_join(death_tokens) %>%
+  mutate(event=if_else(is.na(death_flag),"nonevent","event"))
+
+#anonymyize identifiers
+wide_features<-wide_features %>% select(-ArtistToken,-AirDate,-Date,-death_flag)
+
+#separate training and test sets 70/30
+set.seed(1234)
+train_artists<-blind_artists %>% select(id) %>% sample_frac(0.70)
+test_artists<-blind_artists %>% select(id) %>% anti_join(train_artists)
+arts_data_train <- train_artists %>% left_join(wide_features) %>% arrange(id)
+arts_data_test <- test_artists %>% left_join(wide_features) %>% select(-event)
+
+
+prop.table(table(arts_data_train$event))
+prop.table(table(arts_data_test$event))
+
+arts_data_train %>% 
+  mutate(event_label=ifelse(event=="event","Event","")) %>% 
+  mutate(sum_feat=rowSums(.[4:168])) %>% 
+  filter(id==(filter(blind_artists,ArtistToken=="Prince") %>% pull(id))) %>% 
+  ggplot(aes(time,sum_feat,label=event_label))+geom_col()+
+  geom_text()
+
+write_csv(arts_data_train,"arts_data_train.csv")
+write_csv(arts_data_test,"arts_data_test.csv")
+```
+#A Different Approach: Deep Learning with Keras
+
+```{r}
+temp<-playlists %>% ungroup() %>% filter(ArtistToken!="") %>%
+  group_by(ArtistToken,AirDate,DJ) %>%summarise(n=n()) %>% 
+  spread(DJ,n,fill=0)
+
+load("deaths.rdata")
+
+```
